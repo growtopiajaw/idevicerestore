@@ -896,13 +896,26 @@ static void restore_asr_progress_cb(double progress, void* userdata)
 	}
 }
 
-int restore_send_filesystem(struct idevicerestore_client_t* client, idevice_t device, const char* filesystem)
+int restore_send_filesystem(struct idevicerestore_client_t* client, idevice_t device, plist_t build_identity)
 {
 	asr_client_t asr = NULL;
 
 	info("About to send filesystem...\n");
 
+	ipsw_file_handle_t file = NULL;
+	char* fsname = NULL;
+	if (build_identity_get_component_path(build_identity, "OS", &fsname) < 0) {
+		error("ERROR: Unable to get path for filesystem component\n");
+		return -1;
+	}
+	file = ipsw_file_open(client->ipsw, fsname);
+	if (!file) {
+		error("ERROR: Unable to open '%s' in ipsw\n", fsname);
+		free(fsname);
+	}
+
 	if (asr_open_with_timeout(device, &asr) < 0) {
+		ipsw_file_close(file);
 		error("ERROR: Unable to connect to ASR\n");
 		return -1;
 	}
@@ -913,7 +926,8 @@ int restore_send_filesystem(struct idevicerestore_client_t* client, idevice_t de
 	// this step sends requested chunks of data from various offsets to asr so
 	// it can validate the filesystem before installing it
 	info("Validating the filesystem\n");
-	if (asr_perform_validation(asr, filesystem) < 0) {
+	if (asr_perform_validation(asr, file) < 0) {
+		ipsw_file_close(file);
 		error("ERROR: ASR was unable to validate the filesystem\n");
 		asr_free(asr);
 		return -1;
@@ -923,11 +937,14 @@ int restore_send_filesystem(struct idevicerestore_client_t* client, idevice_t de
 	// once the target filesystem has been validated, ASR then requests the
 	// entire filesystem to be sent.
 	info("Sending filesystem now...\n");
-	if (asr_send_payload(asr, filesystem) < 0) {
+	if (asr_send_payload(asr, file) < 0) {
+		ipsw_file_close(file);
 		error("ERROR: Unable to send payload to ASR\n");
 		asr_free(asr);
 		return -1;
 	}
+	ipsw_file_close(file);
+
 	info("Done sending filesystem\n");
 
 	asr_free(asr);
@@ -2105,7 +2122,7 @@ static int restore_send_image_data(restored_client_t restore, struct idevicerest
 	return 0;
 }
 
-static plist_t restore_get_se_firmware_data(restored_client_t restore, struct idevicerestore_client_t* client, plist_t build_identity, plist_t p_info)
+static plist_t restore_get_se_firmware_data(restored_client_t restore, struct idevicerestore_client_t* client, plist_t build_identity, plist_t p_info, plist_t arguments)
 {
 	const char *comp_name = NULL;
 	char *comp_path = NULL;
@@ -2114,6 +2131,7 @@ static plist_t restore_get_se_firmware_data(restored_client_t restore, struct id
 	plist_t parameters = NULL;
 	plist_t request = NULL;
 	plist_t response = NULL;
+	plist_t p_dgr = NULL;
 	int ret;
 	uint64_t chip_id = 0;
 	plist_t node = plist_dict_get_item(p_info, "SE,ChipID");
@@ -2122,7 +2140,7 @@ static plist_t restore_get_se_firmware_data(restored_client_t restore, struct id
 	}
 	if (chip_id == 0x20211) {
 		comp_name = "SE,Firmware";
-	} else if (chip_id == 0x73 || chip_id == 0x64 || chip_id == 0xC8 || chip_id == 0xD2) {
+	} else if (chip_id == 0x73 || chip_id == 0x64 || chip_id == 0xC8 || chip_id == 0xD2 || chip_id == 0x2C) {
 		comp_name = "SE,UpdatePayload";
 	} else {
 		info("WARNING: Unknown SE,ChipID 0x%" PRIx64 " detected. Restore might fail.\n", (uint64_t)chip_id);
@@ -2135,6 +2153,14 @@ static plist_t restore_get_se_firmware_data(restored_client_t restore, struct id
 			return NULL;
 		}
 		debug("DEBUG: %s: using %s\n", __func__, comp_name);
+	}
+
+	p_dgr = plist_dict_get_item(arguments, "DeviceGeneratedRequest");
+	if (!p_dgr) {
+		info("NOTE: %s: No DeviceGeneratedRequest in firmware updater data request. Continuing anyway.\n", __func__);
+	} else if (!PLIST_IS_DICT(p_dgr)) {
+		error("ERROR: %s: DeviceGeneratedRequest has invalid type!\n", __func__);
+		return NULL;
 	}
 
 	if (build_identity_get_component_path(build_identity, comp_name, &comp_path) < 0) {
@@ -2167,7 +2193,7 @@ static plist_t restore_get_se_firmware_data(restored_client_t restore, struct id
 	plist_dict_merge(&parameters, p_info);
 
 	/* add required tags for SE TSS request */
-	tss_request_add_se_tags(request, parameters, NULL);
+	tss_request_add_se_tags(request, parameters, p_dgr);
 
 	plist_free(parameters);
 
@@ -2180,10 +2206,12 @@ static plist_t restore_get_se_firmware_data(restored_client_t restore, struct id
 		return NULL;
 	}
 
-	if (plist_dict_get_item(response, "SE,Ticket")) {
-		info("Received SE ticket\n");
+	if (plist_dict_get_item(response, "SE2,Ticket")) {
+		info("Received SE2,Ticket\n");
+	} else if (plist_dict_get_item(response, "SE,Ticket")) {
+		info("Received SE,Ticket\n");
 	} else {
-		error("ERROR: No 'SE,Ticket' in TSS response, this might not work\n");
+		error("ERROR: No 'SE ticket' in TSS response, this might not work\n");
 	}
 
 	plist_dict_set_item(response, "FirmwareData", plist_new_data((char*)component_data, (uint64_t) component_size));
@@ -2596,6 +2624,61 @@ static plist_t restore_get_veridian_firmware_data(restored_client_t restore, str
 
 	plist_dict_set_item(response, "FirmwareData", plist_new_data(bin_plist, (uint64_t)bin_size));
 	free(bin_plist);
+
+	return response;
+}
+
+static plist_t restore_get_generic_firmware_data(restored_client_t restore, struct idevicerestore_client_t* client, plist_t build_identity, plist_t p_info, plist_t arguments)
+{
+	plist_t request = NULL;
+	plist_t response = NULL;
+
+	plist_t p_updater_name = plist_dict_get_item(arguments, "MessageArgUpdaterName");
+	const char* s_updater_name = plist_get_string_ptr(p_updater_name, NULL);
+
+	plist_t response_tags = plist_access_path(arguments, 2, "DeviceGeneratedTags", "ResponseTags");
+	const char* response_ticket = NULL;
+	if (PLIST_IS_ARRAY(response_tags)) {
+		plist_t tag0 = plist_array_get_item(response_tags, 0);
+		if (tag0) {
+			response_ticket = plist_get_string_ptr(tag0, NULL);
+		}
+	}
+	if (response_ticket == NULL) {
+		error("ERROR: Unable to determine response ticket from device generated tags");
+		return NULL;
+	}
+
+	/* create TSS request */
+	request = tss_request_new(NULL);
+	if (request == NULL) {
+		error("ERROR: Unable to create %s TSS request\n", s_updater_name);
+		return NULL;
+	}
+
+	/* add device generated request data to request */
+	plist_t device_generated_request = plist_dict_get_item(arguments, "DeviceGeneratedRequest");
+	if (!device_generated_request) {
+		error("ERROR: Could not find DeviceGeneratedRequest in arguments dictionary\n");
+		plist_free(request);
+		return NULL;
+	}
+	plist_dict_merge(&request, device_generated_request);
+
+	info("Sending %s TSS request...\n", s_updater_name);
+	response = tss_request_send(request, client->tss_url);
+	plist_free(request);
+	if (response == NULL) {
+		error("ERROR: Unable to fetch %s ticket\n", s_updater_name);
+		return NULL;
+	}
+
+	if (plist_dict_get_item(response, response_ticket)) {
+		info("Received %s\n", response_ticket);
+	} else {
+		error("ERROR: No '%s' in TSS response, this might not work\n", response_ticket);
+		debug_plist(response);
+	}
 
 	return response;
 }
@@ -3025,7 +3108,7 @@ static int restore_send_firmware_updater_data(restored_client_t restore, struct 
 	plist_get_string_val(p_updater_name, &s_updater_name);
 
 	if (strcmp(s_updater_name, "SE") == 0) {
-		fwdict = restore_get_se_firmware_data(restore, client, build_identity, p_info);
+		fwdict = restore_get_se_firmware_data(restore, client, build_identity, p_info, arguments);
 		if (fwdict == NULL) {
 			error("ERROR: %s: Couldn't get SE firmware data\n", __func__);
 			goto error_out;
@@ -3061,6 +3144,12 @@ static int restore_send_firmware_updater_data(restored_client_t restore, struct 
 			error("ERROR: %s: Couldn't get AppleTCON firmware data\n", __func__);
 			goto error_out;
 		}
+	} else if (strcmp(s_updater_name, "PS190") == 0) {
+		fwdict = restore_get_generic_firmware_data(restore, client, build_identity, p_info, arguments);
+		if (fwdict == NULL) {
+			error("ERROR: %s: Couldn't get PCON1 firmware data\n", __func__);
+			goto error_out;
+		}
 	} else if (strcmp(s_updater_name, "AppleTypeCRetimer") == 0) {
 		fwdict = restore_get_timer_firmware_data(restore, client, build_identity, p_info);
 		if (fwdict == NULL) {
@@ -3074,8 +3163,12 @@ static int restore_send_firmware_updater_data(restored_client_t restore, struct 
 			goto error_out;
 		}
 	} else {
-		error("ERROR: %s: Got unknown updater name '%s'.\n", __func__, s_updater_name);
-		goto error_out;
+		error("ERROR: %s: Got unknown updater name '%s', trying to discover from device generated request.\n", __func__, s_updater_name);
+		fwdict = restore_get_generic_firmware_data(restore, client, build_identity, p_info, arguments);
+		if (fwdict == NULL) {
+			error("ERROR: %s: Couldn't get %s firmware data\n", __func__, s_updater_name);
+			goto error_out;
+		}
 	}
 	free(s_updater_name);
 	s_updater_name = NULL;
@@ -3199,7 +3292,7 @@ static int cpio_send_file(idevice_connection_t connection, const char *name, str
 	return 0;
 }
 
-static int restore_bootability_send_one(void *ctx, const char *ipsw, const char *name, struct stat *stat)
+static int restore_bootability_send_one(void *ctx, ipsw_archive_t ipsw, const char *name, struct stat *stat)
 {
 	idevice_connection_t connection = (idevice_connection_t)ctx;
 	const char *prefix = "BootabilityBundle/Restore/Bootability/";
@@ -3297,7 +3390,10 @@ plist_t restore_get_build_identity(struct idevicerestore_client_t* client, uint8
 			variant, 0);
 
 	plist_t unique_id_node = plist_dict_get_item(client->build_manifest, "UniqueBuildID");
-	debug_plist(unique_id_node);
+	if (unique_id_node) {
+		printf("UniqueBuildID: ");
+		plist_write_to_stream(unique_id_node, stdout, PLIST_FORMAT_PRINT, PLIST_OPT_NONE);
+	}
 
 	return build_identity;
 }
@@ -3668,7 +3764,7 @@ int restore_send_buildidentity(restored_client_t restore, struct idevicerestore_
 	return 0;
 }
 
-int restore_handle_data_request_msg(struct idevicerestore_client_t* client, idevice_t device, restored_client_t restore, plist_t message, plist_t build_identity, const char* filesystem)
+int restore_handle_data_request_msg(struct idevicerestore_client_t* client, idevice_t device, restored_client_t restore, plist_t message, plist_t build_identity)
 {
 	plist_t node = NULL;
 
@@ -3680,7 +3776,7 @@ int restore_handle_data_request_msg(struct idevicerestore_client_t* client, idev
 
 		// this request is sent when restored is ready to receive the filesystem
 		if (!strcmp(type, "SystemImageData")) {
-			if(restore_send_filesystem(client, device, filesystem) < 0) {
+			if(restore_send_filesystem(client, device, build_identity) < 0) {
 				error("ERROR: Unable to send filesystem\n");
 				return -2;
 			}
@@ -3716,7 +3812,7 @@ int restore_handle_data_request_msg(struct idevicerestore_client_t* client, idev
 
 		// this request is sent when restored is ready to receive the filesystem
 		else if (!strcmp(type, "RecoveryOSASRImage")) {
-			if(restore_send_filesystem(client, device, filesystem) < 0) {
+			if(restore_send_filesystem(client, device, build_identity) < 0) {
 				error("ERROR: Unable to send filesystem\n");
 				return -2;
 			}
@@ -3959,7 +4055,7 @@ static void rp_status_cb(reverse_proxy_client_t client, reverse_proxy_status_t s
 }
 #endif
 
-int restore_device(struct idevicerestore_client_t* client, plist_t build_identity, const char* filesystem)
+int restore_device(struct idevicerestore_client_t* client, plist_t build_identity)
 {
 	int err = 0;
 	char* type = NULL;
@@ -4282,7 +4378,7 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 		// files sent to the server by the client. these data requests include
 		// SystemImageData, RootTicket, KernelCache, NORData and BasebandData requests
 		if (!strcmp(type, "DataRequestMsg")) {
-			err = restore_handle_data_request_msg(client, device, restore, message, build_identity, filesystem);
+			err = restore_handle_data_request_msg(client, device, restore, message, build_identity);
 		}
 
 		// restore logs are available if a previous restore failed

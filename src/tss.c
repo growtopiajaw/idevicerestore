@@ -35,7 +35,7 @@
 
 #include "endianness.h"
 
-#define AUTH_VERSION "850.0.2"
+#define AUTH_VERSION "914.120.2"
 
 #ifdef WIN32
 #define TSS_CLIENT_VERSION_STRING "libauthinstall_Win-"AUTH_VERSION"" 
@@ -316,8 +316,7 @@ int tss_request_add_ap_img3_tags(plist_t request, plist_t parameters)
 	}
 
 	if (_plist_dict_copy_data(request, parameters, "ApNonce", NULL) < 0) {
-		error("ERROR: Unable to find required ApNonce in parameters\n");
-		return -1;
+		error("WARNING: Unable to find ApNonce in parameters\n");
 	}
 
 	plist_dict_set_item(request, "@APTicket", plist_new_bool(1));
@@ -786,9 +785,7 @@ int tss_request_add_se_tags(plist_t request, plist_t parameters, plist_t overrid
 		return -1;
 	}
 
-	/* add tags indicating we want to get the SE,Ticket */
 	plist_dict_set_item(request, "@BBTicket", plist_new_bool(1));
-	plist_dict_set_item(request, "@SE,Ticket", plist_new_bool(1));
 
 	if (_plist_dict_copy_uint(request, parameters, "SE,ChipID", NULL) < 0) {
 		error("ERROR: %s: Unable to find required SE,ChipID in parameters\n", __func__);
@@ -862,6 +859,11 @@ int tss_request_add_se_tags(plist_t request, plist_t parameters, plist_t overrid
 	/* apply overrides */
 	if (overrides) {
 		plist_dict_merge(&request, overrides);
+	}
+
+	/* fallback in case no @SE2,Ticket or @SE,Ticket was provided */
+	if (!plist_dict_get_item(request, "@SE2,Ticket") && !plist_dict_get_item(request, "@SE,Ticket")) {
+		plist_dict_set_item(request, "@SE,Ticket", plist_new_bool(1));
 	}
 
 	return 0;
@@ -1524,6 +1526,7 @@ plist_t tss_request_send(plist_t tss_request, const char* server_url_string)
 		curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, strlen(request));
 		if (server_url_string) {
 			curl_easy_setopt(handle, CURLOPT_URL, server_url_string);
+			info("Request URL set to %s\n", server_url_string);
 		} else {
 			int url_index = (retry - 1) % 6;
 			curl_easy_setopt(handle, CURLOPT_URL, urls[url_index]);
